@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"sync" 
 	"time" 
@@ -58,6 +62,13 @@ type FlowStats struct {
 var (
 	flows = make(map[FlowKey]*FlowStats)
 	mu    sync.Mutex // Mutex to protect map access across goroutines
+
+	// Set of ports considered 'server' or 'well-known'
+	wellKnownPorts map[uint16]bool 
+	
+	ifaceName = flag.String("iface", "eth0", "Network interface name (e.g., enp0s1, eth0)")
+	durationStr = flag.String("duration", "1h", "Reporting window duration (e.g., 5s, 30m, 1h)")
+	portsFile = flag.String("ports-file", "", "Path to a file listing well-known server ports (one per line)")
 )
 
 // --- Helper Functions ---
@@ -67,6 +78,48 @@ func uint32ToBytes(u uint32) []byte {
 	b := make([]byte, 4)
 	binary.BigEndian.PutUint32(b, u)
 	return b
+}
+
+// loadWellKnownPorts reads the list of well-known server ports from a file.
+func loadWellKnownPorts(filepath string) map[uint16]bool {
+	ports := make(map[uint16]bool)
+	if filepath == "" {
+		return ports
+	}
+
+	content, err := os.ReadFile(filepath)
+	if err != nil {
+		log.Printf("Warning: Could not read ports file %s: %v. Using default ports.", filepath, err)
+		return ports
+	}
+
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		
+		portInt, err := strconv.ParseUint(line, 10, 16)
+		if err != nil {
+			log.Printf("Warning: Invalid port '%s' in file. Skipping.", line)
+			continue
+		}
+		ports[uint16(portInt)] = true
+	}
+	
+	// Always include standard well-known ports if file is provided or not.
+	ports[21] = true // FTP
+	ports[22] = true // SSH
+	ports[23] = true // Telnet
+	ports[25] = true // SMTP
+	ports[53] = true // DNS (TCP/UDP)
+	ports[80] = true // HTTP
+	ports[443] = true // HTTPS
+	ports[502] = true // Modbus TCP
+	
+	log.Printf("Loaded %d well-known ports for flow direction inference.", len(ports))
+	return ports
 }
 
 // Map IP protocol numbers to human-readable strings.
@@ -89,22 +142,35 @@ func getProtocolName(p uint8) string {
 
 // aggregatePacket updates the flow statistics based on a new packet.
 func aggregatePacket(info *packet_info) {
-	// Create a canonical flow key for aggregation (to handle both directions).
-	// This ensures that A->B and B->A packets map to the same statistics entry.
 	var key FlowKey
 	
-	// Canonical flow check: compare IP addresses first, then ports if IPs are equal.
-	// Note: Comparing ports is only valid for protocols that use them (TCP/UDP).
-	isCanonical := false
-	if info.Saddr < info.Daddr {
-		isCanonical = true
-	} else if info.Saddr == info.Daddr {
-		// Use transport ports as tie-breaker for the canonical flow key
-		if info.Sport < info.Dport {
-			isCanonical = true
-		}
+	// Canonical flow determination: A is the client, B is the server.
+	
+	// 1. Check well-known ports (for TCP/UDP only)
+	isWellKnown := false
+	if info.Protocol == uint8(layers.IPProtocolTCP) || info.Protocol == uint8(layers.IPProtocolUDP) {
+		isWellKnown = wellKnownPorts[info.Sport] || wellKnownPorts[info.Dport]
 	}
 	
+	isCanonical := false
+	
+	if isWellKnown {
+		// If both ports are well-known, revert to IP ordering to avoid ambiguity.
+		if wellKnownPorts[info.Sport] && wellKnownPorts[info.Dport] {
+			isCanonical = info.Saddr < info.Daddr || (info.Saddr == info.Daddr && info.Sport < info.Dport)
+		} else if wellKnownPorts[info.Dport] {
+			// Traffic is CLIENT(Sport) -> SERVER(Dport). This is canonical.
+			isCanonical = true
+		} else {
+			// Traffic is SERVER(Sport) -> CLIENT(Dport). This is REVERSE canonical.
+			isCanonical = false
+		}
+	} else {
+		// 2. If no well-known ports, use IP address ordering as the tie-breaker
+		isCanonical = info.Saddr < info.Daddr || (info.Saddr == info.Daddr && info.Sport < info.Dport)
+	}
+
+
 	if isCanonical {
 		// Direction 1: A->B
 		key = FlowKey{
@@ -137,15 +203,21 @@ func aggregatePacket(info *packet_info) {
 		flows[key] = stats
 	}
 
+	// The C code currently sends PktCount=1, ByteCount=pkt_len.
+	// We aggregate them here.
 	stats.TotalPackets += info.PktCount
 	stats.TotalBytes += uint64(info.ByteCount)
 	stats.LastSeen = time.Now().Unix()
 }
 
 // printReport periodically prints the aggregated flow statistics.
-func printReport() {
-	ticker := time.NewTicker(5 * time.Second)
+func printReport(reportDuration time.Duration) {
+	// Use the command-line duration for the ticker interval
+	ticker := time.NewTicker(reportDuration)
 	defer ticker.Stop()
+
+	// Simple flow cleanup timeout (3x the report duration)
+	cleanupTimeout := int64(reportDuration.Seconds()) * 3
 
 	for range ticker.C {
 		mu.Lock()
@@ -154,9 +226,9 @@ func printReport() {
 			continue
 		}
 
-		// Clear screen and print header (simulating a screen refresh like 'top' or 'iftop')
-		fmt.Print("\033[H\033[2J") // ANSI sequence to clear screen and home cursor
-		fmt.Println("--- Network Flow Monitor (Aggregated, Last 5s Window) ---")
+		// Clear screen and print header
+		fmt.Print("\033[H\033[2J") 
+		fmt.Println("--- Network Flow Monitor (Aggregated, Reporting Window:", reportDuration.String(), ") ---")
 		fmt.Println("Flows tracked:", len(flows))
 		fmt.Println(
 			"--------------------------------------------------------------------------------------------------------------\n" +
@@ -169,14 +241,12 @@ func printReport() {
 		flowsToKeep := make(map[FlowKey]*FlowStats)
 
 		for key, stats := range flows {
-			// Calculate elapsed time
 			elapsed := currentTime - stats.LastSeen
 
-			// Format A and B IP/Port (always print flow based on canonical A->B)
+			// Format A and B IP/Port (A is the client side of the canonical flow)
 			srcIP := net.IP(uint32ToBytes(key.Saddr)).String()
 			dstIP := net.IP(uint32ToBytes(key.Daddr)).String()
 			
-			// Format A:B ports (use canonical A:B, which may be S:D or D:S from the original packet)
 			srcPort := ""
 			dstPort := ""
 			if key.Sport != 0 || key.Dport != 0 {
@@ -194,12 +264,12 @@ func printReport() {
 				elapsed,
 			)
 
-			// Simple cleanup: If a flow hasn't been seen in 3 reporting intervals (15 seconds), discard it.
-			if elapsed < 15 {
+			// Cleanup: If flow hasn't been seen in the cleanup timeout, discard it.
+			if elapsed < cleanupTimeout {
 				flowsToKeep[key] = stats
 			}
 			
-			// Reset counters for the next 5-second window
+			// Reset counters for the next reporting window
 			stats.TotalPackets = 0
 			stats.TotalBytes = 0
 		}
@@ -211,23 +281,34 @@ func printReport() {
 
 
 func main() {
+	// Parse command line arguments
+	flag.Parse()
+	
+	// Parse duration string into time.Duration
+	reportDuration, err := time.ParseDuration(*durationStr)
+	if err != nil {
+		log.Fatalf("Invalid duration format: %v. Use formats like 5s, 1m, 1h.", err)
+	}
+
+	// Load well-known ports based on the flag
+	wellKnownPorts = loadWellKnownPorts(*portsFile)
+
 	// Step 1: Set up signal handler for graceful exit.
 	stopper := make(chan os.Signal, 1)
 	signal.Notify(stopper, os.Interrupt, syscall.SIGTERM)
 
 	// Step 2: Load the eBPF program (NetMonitor).
+	// We rely on 'go generate' having been run successfully.
 	objs := ebpfObjects{}
 	if err := loadEbpfObjects(&objs, nil); err != nil {
-		log.Fatalf("loading eBPF objects: %v", err)
+		log.Fatalf("Loading eBPF objects failed. Did you run 'go generate ./...'? Error: %v", err)
 	}
 	defer objs.Close()
 
 	// Step 3: Determine the interface index (ifindex) for attachment.
-	ifname := "enp0s1" // *** IMPORTANT: Change this to your network interface name (e.g., eth0, ens33, enp0s3) ***
-	
-	iface, err := net.InterfaceByName(ifname)
+	iface, err := net.InterfaceByName(*ifaceName)
 	if err != nil {
-		log.Fatalf("could not find interface %s: %v", ifname, err)
+		log.Fatalf("Could not find network interface '%s': %v", *ifaceName, err)
 	}
 	ifindex := iface.Index
 	
@@ -238,20 +319,21 @@ func main() {
 		Flags:     0,
 	})
 	if err != nil {
-		log.Fatalf("attaching XDP program to %s (index %d): %v", ifname, ifindex, err)
+		log.Fatalf("Attaching XDP program to %s (index %d) failed: %v", *ifaceName, ifindex, err)
 	}
 	defer progLink.Close()
-	log.Printf("eBPF Network Monitor attached to %s (index %d)", ifname, ifindex)
+	log.Printf("eBPF Network Monitor attached to %s (index %d). Reporting every %s.", *ifaceName, ifindex, reportDuration.String())
 
 	// Step 5: Create a ring buffer reader to receive data from the kernel.
-	rd, err := ringbuf.NewReader(objs.Packets) // 'Packets' map name is defined in capture.c
+	rd, err := ringbuf.NewReader(objs.Packets) 
 	if err != nil {
-		log.Fatalf("creating ring buffer reader: %v", err)
+		log.Fatalf("Creating ring buffer reader failed: %v", err)
 	}
 	defer rd.Close()
 
-	// Step 6: Start the reporting goroutine immediately.
-	go printReport()
+	// Step 6: Start the reporting goroutine.
+	// Pass the dynamically parsed duration.
+	go printReport(reportDuration)
 	
 	// Step 7: Start goroutine to read from the ring buffer and aggregate data.
 	go func() {
@@ -259,7 +341,7 @@ func main() {
 		for {
 			record, err := rd.Read()
 			if err != nil {
-				if err == ringbuf.ErrClosed {
+				if errors.Is(err, ringbuf.ErrClosed) { // Use errors.Is for comparison
 					return
 				}
 				log.Printf("reading from ring buffer: %v", err)
@@ -267,12 +349,13 @@ func main() {
 			}
 			
 			// Decode the raw bytes from the kernel into our Go struct.
+			// The use of align:"1" tag in the struct helps ensure correct decoding here.
 			if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &info); err != nil {
 				log.Printf("decoding packet info: %v", err)
 				continue
 			}
 			
-			// Instead of printing, aggregate the received packet data.
+			// Aggregate the received packet data.
 			aggregatePacket(&info)
 		}
 	}()
